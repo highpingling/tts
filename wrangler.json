@@ -1,5 +1,6 @@
 {
-  "name": "tts-worker",
+  "name": "tts",
   "main": "tts.js",
-  "compatibility_date": "2025-10-29"
+  "compatibility_date": "2025-10-29",
+  "workers_dev": true
 }
