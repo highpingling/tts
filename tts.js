@@ -1,8 +1,8 @@
 // ==========================
-// Cloudflare Worker: MiniMax TTS Proxy
+// Cloudflare Worker: MiniMax TTS Proxy (Final Fixed)
 // ==========================
 
-const MINIMAX_TTS_ENDPOINT = "https://api.minimax.chat/v1/t2a_v2"; // ✅ 正确端点
+const MINIMAX_TTS_ENDPOINT = "https://api.minimax.chat/v1/t2a_v2";
 
 export default {
   async fetch(request, env) {
@@ -18,14 +18,13 @@ export default {
       });
     }
 
-    // 限定只允许 POST 请求到根路径
     const url = new URL(request.url);
     if (request.method !== 'POST' || url.pathname !== '/') {
       return new Response('Method Not Allowed or Invalid Path', { status: 405 });
     }
 
     try {
-      // === 1. 从 Cloudflare Secrets 中读取配置 ===
+      // === 1. 环境变量 ===
       const apiKey = env.MINIMAX_API_KEY;
       const groupId = env.GROUP_ID;
       const voiceId = env.VOICE_ID;
@@ -34,44 +33,53 @@ export default {
         return new Response('Server configuration error: Missing API key or IDs.', { status: 500 });
       }
 
-      // === 2. 解析请求体 ===
+      // === 2. 读取请求体 ===
       const body = await request.json();
       const text = body.text;
       if (!text) {
         return new Response('Missing "text" field in request body.', { status: 400 });
       }
 
-      // === 3. 构建 MiniMax 请求 ===
-      const minimaxBody = JSON.stringify({
-        model: "speech-2.5-hd-preview", // ✅ 根据账单使用的模型
-        voice_id: voiceId,
-        text,
-        speed: 1.0,
-        vol: 1.0,
-        pitch: 0
-      });
-
-      // === 4. 发送请求到 MiniMax ===
+      // === 3. 向 MiniMax 发请求 ===
       const minimaxResp = await fetch(`${MINIMAX_TTS_ENDPOINT}?GroupId=${groupId}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`,
         },
-        body: minimaxBody
+        body: JSON.stringify({
+          model: "speech-2.5-hd-preview",
+          text,
+          voice_id: voiceId,
+          speed: 1.0,
+          vol: 1.0,
+          pitch: 0
+        })
       });
 
-      // === 5. 检查响应 ===
-      if (!minimaxResp.ok) {
-        const errText = await minimaxResp.text();
-        return new Response(`MiniMax API Error: ${minimaxResp.status} - ${errText}`, {
-          status: minimaxResp.status,
+      const json = await minimaxResp.json();
+
+      // === 4. 检查返回是否正常 ===
+      if (!json?.base_resp || json.base_resp.status_code !== 0) {
+        return new Response(`MiniMax API Error: ${JSON.stringify(json)}`, {
+          status: 500,
           headers: { 'Access-Control-Allow-Origin': '*' },
         });
       }
 
-      // === 6. 返回音频文件 ===
-      const audioData = await minimaxResp.arrayBuffer();
+      // === 5. 获取音频文件 URL ===
+      const audioUrl = json.data?.audio_file;
+      if (!audioUrl) {
+        return new Response('No audio file returned from MiniMax.', {
+          status: 500,
+          headers: { 'Access-Control-Allow-Origin': '*' },
+        });
+      }
+
+      // === 6. 拉取音频二进制并返回给前端 ===
+      const audioResp = await fetch(audioUrl);
+      const audioData = await audioResp.arrayBuffer();
+
       return new Response(audioData, {
         headers: {
           'Content-Type': 'audio/mpeg',
