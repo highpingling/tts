@@ -1,83 +1,89 @@
-// worker.js - 部署在 Cloudflare Workers
+// ==========================
+// Cloudflare Worker: MiniMax TTS Proxy
+// ==========================
 
-// Minimax TTS API 的实际端点
-// 请根据 Minimax AI 文档检查这个 URL 是否正确，特别是版本号
-const MINIMAX_TTS_ENDPOINT = "https://api.minimax.chat/v1/text_to_speech"; 
+const MINIMAX_TTS_ENDPOINT = "https://api.minimax.chat/v1/t2a_v2"; // ✅ 正确端点
 
-// 处理所有请求的函数
-// `env` 参数会自动由 Cloudflare Workers 运行时提供，包含你设置的环境变量
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request, event.env));
-});
+export default {
+  async fetch(request, env) {
+    // 允许跨域（前端 fetch）
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        },
+      });
+    }
 
-async function handleRequest(request, env) { // 接收 env 参数
-  // 1. 检查请求方法和路径
-  if (request.method !== 'POST' || new URL(request.url).pathname !== '/') {
-    return new Response('Method Not Allowed or Invalid Path', { status: 405 });
+    // 限定只允许 POST 请求到根路径
+    const url = new URL(request.url);
+    if (request.method !== 'POST' || url.pathname !== '/') {
+      return new Response('Method Not Allowed or Invalid Path', { status: 405 });
+    }
+
+    try {
+      // === 1. 从 Cloudflare Secrets 中读取配置 ===
+      const apiKey = env.MINIMAX_API_KEY;
+      const groupId = env.GROUP_ID;
+      const voiceId = env.VOICE_ID;
+
+      if (!apiKey || !groupId || !voiceId) {
+        return new Response('Server configuration error: Missing API key or IDs.', { status: 500 });
+      }
+
+      // === 2. 解析请求体 ===
+      const body = await request.json();
+      const text = body.text;
+      if (!text) {
+        return new Response('Missing "text" field in request body.', { status: 400 });
+      }
+
+      // === 3. 构建 MiniMax 请求 ===
+      const minimaxBody = JSON.stringify({
+        model: "speech-2.5-hd-preview", // ✅ 根据账单使用的模型
+        voice_id: voiceId,
+        text,
+        speed: 1.0,
+        vol: 1.0,
+        pitch: 0
+      });
+
+      // === 4. 发送请求到 MiniMax ===
+      const minimaxResp = await fetch(`${MINIMAX_TTS_ENDPOINT}?GroupId=${groupId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: minimaxBody
+      });
+
+      // === 5. 检查响应 ===
+      if (!minimaxResp.ok) {
+        const errText = await minimaxResp.text();
+        return new Response(`MiniMax API Error: ${minimaxResp.status} - ${errText}`, {
+          status: minimaxResp.status,
+          headers: { 'Access-Control-Allow-Origin': '*' },
+        });
+      }
+
+      // === 6. 返回音频文件 ===
+      const audioData = await minimaxResp.arrayBuffer();
+      return new Response(audioData, {
+        headers: {
+          'Content-Type': 'audio/mpeg',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      });
+
+    } catch (err) {
+      console.error("Worker Error:", err);
+      return new Response(`Worker Error: ${err.message}`, { status: 500 });
+    }
   }
-
-  try {
-    // 从环境变量中读取敏感信息
-    const MINIMAX_API_KEY = env.MINIMAX_API_KEY;
-    const MINIMAX_GROUP_ID = env.MINIMAX_GROUP_ID;
-    const MINIMAX_VOICE_ID = env.MINIMAX_VOICE_ID;
-
-    // 验证环境变量是否已设置
-    if (!MINIMAX_API_KEY || !MINIMAX_GROUP_ID || !MINIMAX_VOICE_ID) {
-      console.error("Minimax AI credentials are not configured in Worker environment variables.");
-      return new Response('Server configuration error: Minimax AI credentials missing.', { status: 500 });
-    }
-
-
-    // 2. 解析前端发来的 JSON 数据 (包含要转语音的文本)
-    const requestBody = await request.json();
-    const textToSpeak = requestBody.text;
-
-    if (!textToSpeak) {
-      return new Response('Missing "text" in request body', { status: 400 });
-    }
-
-    // 3. 构建 Minimax TTS API 的请求体
-    const minimaxRequestBody = JSON.stringify({
-      model: "speech-01", // Minimax TTS 模型名称，根据文档可能不同
-      voice_id: MINIMAX_VOICE_ID,
-      text: textToSpeak,
-      speed: 1.0,         // 语速，可调
-      vol: 1.0,           // 音量，可调
-      pitch: 0,           // 音调，可调
-    });
-
-    // 4. 发送请求到 Minimax TTS API
-    // 注意：Minimax AI 的 Group ID 通常作为查询参数传递，请再次确认文档
-    const minimaxResponse = await fetch(`${MINIMAX_TTS_ENDPOINT}?GroupId=${MINIMAX_GROUP_ID}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${MINIMAX_API_KEY}`, // 通常是 Bearer Token，请确认
-      },
-      body: minimaxRequestBody,
-    });
-
-    // 5. 检查 Minimax AI 的响应是否成功
-    if (!minimaxResponse.ok) {
-      const errorText = await minimaxResponse.text();
-      console.error('Minimax TTS API Error:', minimaxResponse.status, errorText);
-      return new Response(`Minimax TTS API Error: ${minimaxResponse.status} - ${errorText}`, { status: minimaxResponse.status });
-    }
-
-    // 6. 返回 Minimax AI 传回的音频数据给前端
-    const audioBlob = await minimaxResponse.blob();
-    return new Response(audioBlob, {
-      headers: {
-        'Content-Type': 'audio/mpeg', // 根据 Minimax AI 返回的实际音频格式调整，例如 'audio/wav'
-        'Access-Control-Allow-Origin': '*', // 允许所有来源访问，如果你只想特定域名访问，可以修改这里
-        'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      },
-    });
-
-  } catch (error) {
-    console.error('Worker error:', error);
-    return new Response(`Worker Error: ${error.message}`, { status: 500 });
-  }
-}
+};
