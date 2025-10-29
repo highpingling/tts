@@ -1,124 +1,116 @@
 // ==========================
-// Cloudflare Worker: MiniMax TTS Proxy (FIXED VERSION)
+// Cloudflare Worker: MiniMax TTS Proxy (Optimized for HTTP POST API)
 // ==========================
 
-const MINIMAX_TTS_ENDPOINT = "https://api.minimax.chat/v1/t2a_v2";
+// **重要：请根据 MiniMax 官方文档核实这个 HTTP API 端点**
+// 如果文档显示不同的端点，请务必修改！
+const MINIMAX_TTS_HTTP_ENDPOINT = "https://api.minimax.chat/v1/text_to_speech"; // 这是一个常见假设，务必核实！
 
 export default {
   async fetch(request, env) {
-    // 处理 CORS
+    // 处理 CORS 预检请求
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          'Access-Control-Max-Age': '86400', // 缓存预检结果24小时
         },
       });
     }
 
     const url = new URL(request.url);
+    // 只接受根路径的 POST 请求
     if (request.method !== 'POST' || url.pathname !== '/') {
-      return new Response('Method Not Allowed or Invalid Path', { status: 405 });
+      return new Response('Method Not Allowed or Invalid Path. Please use POST to /', { status: 405 });
     }
 
     try {
-      // === 1. 环境变量 ===
+      // === 1. 环境变量检查 ===
       const apiKey = env.MINIMAX_API_KEY;
       const groupId = env.GROUP_ID;
       const voiceId = env.VOICE_ID;
       if (!apiKey || !groupId || !voiceId) {
-        console.error("DEBUG: Missing API key or IDs.");
-        return new Response('Server configuration error: Missing API key or IDs.', { status: 500 });
+        console.error("DEBUG: Server configuration error - Missing MINIMAX_API_KEY, GROUP_ID, or VOICE_ID in environment variables.");
+        return new Response('Server configuration error: Missing API key or IDs. Please check Worker environment variables.', { status: 500 });
       }
 
-      // === 2. 请求体 ===
-      const body = await request.json();
-      const text = body.text;
-      if (!text) {
-        console.error("DEBUG: Missing 'text' field in request body.");
-        return new Response('Missing \"text\" field in request body.', { status: 400 });
+      // === 2. 解析请求体 ===
+      const requestBody = await request.json();
+      const text = requestBody.text;
+      if (!text || typeof text !== 'string' || text.trim() === '') {
+        console.error("DEBUG: Invalid request body - Missing or empty 'text' field.");
+        return new Response('Invalid request body: Missing or empty "text" field.', { status: 400 });
       }
 
-      // === 3. 调用 MiniMax API ===
-      const minimaxResp = await fetch(`${MINIMAX_TTS_ENDPOINT}?group_id=${groupId}`, {
+      // === 3. 构造 MiniMax TTS API 请求 ===
+      // MiniMax HTTP TTS API 通常将 group_id 放在 URL query 参数中
+      const minimaxApiUrl = `${MINIMAX_TTS_HTTP_ENDPOINT}?Group_id=${groupId}`; // 注意：`Group_id` 的大小写也需核实
+
+      const minimaxRequestBody = JSON.stringify({
+        model: "speech-2.5-hd-preview", // 保持与你 Python 代码中的模型一致
+        text: text,
+        voice_id: voiceId,
+        speed: 1.0,
+        vol: 1.0,
+        pitch: 0,
+        // 如果 HTTP API 需要其他参数，请在这里添加
+        // audio_output_format: "mp3", // MiniMax 的 HTTP API 可能有此参数
+      });
+
+      console.log(`DEBUG: Sending request to MiniMax URL: ${minimaxApiUrl}`);
+      console.log(`DEBUG: MiniMax Request Body: ${minimaxRequestBody}`);
+
+      const minimaxResp = await fetch(minimaxApiUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({
-          model: "speech-2.5-hd-preview",
-          text,
-          voice_id: voiceId,
-          speed: 1.0,
-          vol: 1.0,
-          pitch: 0,
-        }),
+        body: minimaxRequestBody,
       });
 
+      // === 4. 处理 MiniMax API 响应 ===
       if (!minimaxResp.ok) {
-        const rawErrorText = await minimaxResp.text();
-        console.error("DEBUG: MiniMax non-OK response:", rawErrorText);
-        return new Response(`MiniMax upstream error (status ${minimaxResp.status}): ${rawErrorText}`, {
+        // 如果 MiniMax 返回非 2xx 状态码
+        const errorText = await minimaxResp.text();
+        console.error(`DEBUG: MiniMax upstream error (status ${minimaxResp.status}): ${errorText}`);
+        return new Response(`MiniMax API returned an error (status ${minimaxResp.status}): ${errorText}`, {
           status: minimaxResp.status,
           headers: { 'Access-Control-Allow-Origin': '*' },
         });
       }
 
-      const json = await minimaxResp.json();
+      // **重要：这里假设 MiniMax HTTP API 直接返回音频二进制流**
+      // 如果 MiniMax 实际上返回一个 JSON 对象，其中包含音频数据或一个下载 URL，
+      // 你需要调整这里的逻辑。
 
-      if (!json?.base_resp || json.base_resp.status_code !== 0) {
-        console.error("DEBUG: MiniMax API Error (status_code not 0):", JSON.stringify(json));
-        return new Response(`MiniMax API Error: ${JSON.stringify(json)}`, {
+      // 检查 Content-Type，确保它是音频类型
+      const contentType = minimaxResp.headers.get('Content-Type');
+      if (!contentType || !contentType.startsWith('audio/')) {
+        const unexpectedResponse = await minimaxResp.text();
+        console.error(`DEBUG: MiniMax returned unexpected Content-Type: ${contentType}. Full response: ${unexpectedResponse}`);
+        return new Response(`MiniMax returned an unexpected content type. Expected audio, got: ${contentType}`, {
           status: 500,
           headers: { 'Access-Control-Allow-Origin': '*' },
         });
       }
 
-      // === 4. 获取音频 ===
-      let audioBuffer;
-      if (json.data?.audio_file) {
-        console.log("DEBUG: Found audio_file URL:", json.data.audio_file);
-        const audioResp = await fetch(json.data.audio_file);
-
-        if (!audioResp.ok) {
-          const audioFetchError = await audioResp.text();
-          console.error("DEBUG: Secondary audio fetch failed:", audioFetchError);
-          return new Response(`Failed to fetch audio from URL: ${audioFetchError}`, {
-            status: 500,
-            headers: { 'Access-Control-Allow-Origin': '*' },
-          });
-        }
-        audioBuffer = await audioResp.arrayBuffer();
-      } else if (json.data?.audio) {
-        console.log("DEBUG: Found base64 audio.");
-        const binary = atob(json.data.audio);
-        const len = binary.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-        audioBuffer = bytes.buffer;
-      } else {
-        console.error("DEBUG: No audio data (audio_file or base64) found.");
-        return new Response('No audio data found in MiniMax response.', {
-          status: 500,
-          headers: { 'Access-Control-Allow-Origin': '*' },
-        });
-      }
-
-      // === 5. 返回音频 ===
-      return new Response(audioBuffer, {
+      // === 5. 返回音频数据给客户端 ===
+      // 直接将 MiniMax 的响应体（音频流）返回给请求方
+      return new Response(minimaxResp.body, {
         headers: {
-          'Content-Type': 'audio/mpeg',
+          'Content-Type': contentType, // 使用 MiniMax 返回的实际 Content-Type
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
+          // 可以添加其他缓存控制头
+          // 'Cache-Control': 'public, max-age=3600',
         },
       });
 
     } catch (err) {
-      console.error("Worker Error (caught):", err.message, err.stack);
+      console.error("DEBUG: Worker Error (caught exception):", err.message, err.stack);
       return new Response(`Worker Error (Caught Exception): ${err.message}`, {
         status: 500,
         headers: { 'Access-Control-Allow-Origin': '*' },
